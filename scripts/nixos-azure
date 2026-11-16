@@ -64,8 +64,12 @@ builder_up() {
   if az vm show $(rg_) -n "$BUILDER" -o none 2>/dev/null; then
     az vm start $(rg_) -n "$BUILDER" -o none; return
   fi
-  local img; img=$(latest_version)
-  if [ -n "$img" ]; then
+  local img=${BUILDER_IMAGE:-}
+  [ -n "$img" ] || img=$(latest_version)
+  if [ "$img" = ubuntu ]; then
+    log "creating builder from Ubuntu 24.04 Arm64"
+    img="Canonical:ubuntu-24_04-lts:server-arm64:latest"
+  elif [ -n "$img" ]; then
     log "creating builder from our image $img"
     img=$(image_id "$img")
   else
@@ -136,27 +140,52 @@ cmd_publish() {
 
 # --- test ------------------------------------------------------------------
 cmd_test() {
-  local ver=${1:-$(latest_version)} vm="$TEMP_PREFIX-test" out
-  log "booting $vm from $ver"
+  local ver=${1:-$(latest_version)} vm="$TEMP_PREFIX-test" out agent rc=0
+  local grown=$((TEST_OS_DISK_GB + 16))
+  log "booting $vm from $ver with a $TEST_OS_DISK_GB GB OS disk"
   az vm create $(rg_) -n "$vm" -l "$AZ_LOCATION" --size "$TEST_SIZE" --image "$(image_id "$ver")" \
     --os-disk-size-gb "$TEST_OS_DISK_GB" --admin-username "$ADMIN_USER" --ssh-key-values "$SSH_PUBLIC_KEY" \
     --public-ip-address "" --nsg-rule NONE --tags "$TAG" -o none
   sleep 60
-  local agent; agent=$(az vm get-instance-view $(rg_) -n "$vm" --query 'instanceView.vmAgent.statuses[0].displayStatus' -o tsv)
-  out=$(vm_run "$vm" "
-    check() { if eval \"\$2\" >/dev/null 2>&1; then echo \"PASS \$1\"; else echo \"FAIL \$1\"; fi; }
+  agent=$(az vm get-instance-view $(rg_) -n "$vm" --query 'instanceView.vmAgent.statuses[0].displayStatus' -o tsv)
+  if [ "$agent" = Ready ]; then echo "PASS waagent Ready"; else echo "FAIL waagent: $agent"; rc=1; fi
+  out=$(vm_run "$vm" "$(checks_script "$TEST_OS_DISK_GB")
     check 'admin user exists'          'id $ADMIN_USER'
     check 'admin has ssh key'          'test -s /home/$ADMIN_USER/.ssh/authorized_keys'
     check 'admin passwordless sudo'    'sudo -n -u $ADMIN_USER sudo -n true'
     check 'root ssh login blocked'     '! grep -q \"^ssh-\" /root/.ssh/authorized_keys'
-    check 'no failed units'            'test -z \"\$(systemctl --failed --no-legend)\"'
     check 'sshd active'                'systemctl is-active sshd'
     check 'cloud-final active'         'systemctl is-active cloud-final'
-    check 'root fs grown'              'test \$(df -BG --output=size / | tail -1 | tr -dc 0-9) -ge $((TEST_OS_DISK_GB - 2))'
     check 'tools on agent PATH'        'command -v sudo tar nix'
+    check 'flake in /etc/nixos'        'test -f /etc/nixos/flake.lock'
     echo VERSION \$(nixos-version)")
-  echo "agent: $agent"; grep -E '^(PASS|FAIL|VERSION)' <<<"$out"
-  [ "$agent" = Ready ] && ! grep -q '^FAIL' <<<"$out"
+  grep -E '^(PASS|FAIL|INFO|VERSION)' <<<"$out"; grep -q '^FAIL' <<<"$out" && rc=1
+
+  # Resize after deployment: grow the OS disk while deallocated, then check that
+  # the partition and filesystem follow on the next boot.
+  log "resizing OS disk to $grown GB and restarting"
+  local disk; disk=$(az vm show $(rg_) -n "$vm" --query storageProfile.osDisk.name -o tsv)
+  az vm deallocate $(rg_) -n "$vm" -o none
+  az disk update $(rg_) -n "$disk" --size-gb "$grown" -o none
+  az vm start $(rg_) -n "$vm" -o none
+  sleep 30
+  out=$(vm_run "$vm" "$(checks_script "$grown")")
+  grep -E '^(PASS|FAIL|INFO)' <<<"$out"; grep -q '^FAIL' <<<"$out" && rc=1
+  return $rc
+}
+
+# Common checks: root partition and filesystem fill a disk of $1 GB, nothing failed.
+checks_script() {
+  cat <<EOS
+    check() { if eval "\$2" >/dev/null 2>&1; then echo "PASS \$1"; else echo "FAIL \$1"; fi; }
+    echo "INFO disk \$(lsblk -bndo SIZE /dev/sda) part \$(lsblk -bndo SIZE /dev/sda2) fs \$(df -B1 --output=size / | tail -1)"
+    check 'no failed units ($1 GB)'          'test -z "\$(systemctl --failed --no-legend)"'
+    check 'root partition fills disk ($1 GB)' 'test \$(( \$(lsblk -bndo SIZE /dev/sda) - \$(lsblk -bndo SIZE /dev/sda2) )) -lt \$((300 * 1024 * 1024))'
+    fsb() { tune2fs -l /dev/sda2 | awk -F: -v k="\$1" '\$1==k {gsub(/ /,"",\$2); print \$2}'; }
+    check 'root fs fills partition ($1 GB)'   'test \$(( \$(lsblk -bndo SIZE /dev/sda2) - \$(fsb "Block count") * \$(fsb "Block size") )) -lt \$((8 * 1024 * 1024))'
+    check 'root fs at least $(($1 - 2)) GB'   'test \$(df -BG --output=size / | tail -1 | tr -dc 0-9) -ge $(($1 - 2))'
+    check 'growpart ran'                      'systemctl is-active growpart'
+EOS
 }
 
 # --- cleanup ---------------------------------------------------------------
