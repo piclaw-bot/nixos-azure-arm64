@@ -1,0 +1,31 @@
+--- a/nixos/modules/virtualisation/azure-image.nix
++++ b/nixos/modules/virtualisation/azure-image.nix
+@@ -90,14 +90,20 @@
+       # Azure expects vhd format with fixed size,
+       # generating raw format and convert with subformat args afterwards
+       format = "raw";
+-      postVM = ''
+-        ${lib.getExe' pkgs.vmTools.qemu "qemu-img"} convert -f raw -o subformat=fixed,force_size -O vpc $diskImage $out/${config.image.fileName}
+-        rm $diskImage
+-      ''
+-      + lib.optionalString (cfg.diskSize == "auto") ''
+-        truncate -s +${cfg.additionalSpace} "$out/${config.image.fileName}"
+-        ${lib.getExe' pkgs.cloud-utils "growpart"} "$out/${config.image.fileName}" 1
+-      '';
++      postVM =
++        # Grow the raw image before conversion: resizing the VHD afterwards leaves the
++        # footer mid-file, and on the v2 (EFI) layout the root filesystem is partition 2.
++        lib.optionalString (cfg.diskSize == "auto") ''
++          truncate -s +${cfg.additionalSpace} $diskImage
++          truncate -s %1M $diskImage
++          ${lib.getExe' pkgs.cloud-utils "growpart"} $diskImage ${
++            if cfg.vmGeneration == "v2" then "2" else "1"
++          }
++        ''
++        + ''
++          ${lib.getExe' pkgs.vmTools.qemu "qemu-img"} convert -f raw -o subformat=fixed,force_size -O vpc $diskImage $out/${config.image.fileName}
++          rm $diskImage
++        '';
+       configFile = ./azure-config-user.nix;
+ 
+       bootSize = "${toString cfg.bootSize}M";

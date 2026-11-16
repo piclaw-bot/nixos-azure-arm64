@@ -1,0 +1,5 @@
+config.env
+result
+result-*
+*.vhd
+.state/

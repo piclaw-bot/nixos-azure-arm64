@@ -1,0 +1,193 @@
+#!/usr/bin/env bash
+# Build, upload, publish and test the NixOS Arm64 Azure image.
+# Usage: scripts/nixos-azure <command> [options]   (see README.md)
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+STATE="$ROOT/.state"; mkdir -p "$STATE"
+CONFIG=${CONFIG:-$ROOT/config.env}
+[ -f "$CONFIG" ] || { echo "missing $CONFIG (copy config.example.env)" >&2; exit 1; }
+# shellcheck disable=SC1090
+. "$CONFIG"
+
+TAG="nixos-azure-image=$TEMP_PREFIX"
+BUILDER="$TEMP_PREFIX-build"
+NIXCONF=$'experimental-features = nix-command flakes\nextra-system-features = kvm'
+az() { command az ${AZ_SUBSCRIPTION:+--subscription "$AZ_SUBSCRIPTION"} "$@"; }
+log() { printf '\033[1m==> %s\033[0m\n' "$*" >&2; }
+die() { echo "error: $*" >&2; exit 1; }
+rg_() { echo -g "$AZ_RESOURCE_GROUP"; }
+
+# Run a shell script on a VM through Run Command (works without inbound SSH).
+# The guest agent's PATH is minimal, so the system profile is prepended.
+vm_run() {
+  local vm=$1 script=$2
+  az vm run-command invoke $(rg_) -n "$vm" --command-id RunShellScript \
+    --scripts "export PATH=/run/wrappers/bin:/run/current-system/sw/bin:/nix/var/nix/profiles/default/bin:\$PATH; $script" \
+    --query 'value[0].message' -o tsv
+}
+
+latest_version() {
+  az sig image-version list $(rg_) -r "$GALLERY_NAME" -i "$IMAGE_DEFINITION" \
+    --query "[?provisioningState=='Succeeded'].name" -o tsv 2>/dev/null | sort -V | tail -1
+}
+next_version() {
+  local v; v=$(latest_version)
+  [ -z "$v" ] && { echo 1.0.0; return; }
+  IFS=. read -r a b c <<<"$v"; echo "$a.$b.$((c + 1))"
+}
+image_id() {
+  az sig image-version show $(rg_) -r "$GALLERY_NAME" -i "$IMAGE_DEFINITION" -e "$1" --query id -o tsv
+}
+
+cmd_gallery_init() {
+  log "creating gallery $GALLERY_NAME and definition $IMAGE_DEFINITION"
+  az sig create $(rg_) -l "$AZ_LOCATION" -r "$GALLERY_NAME" -o none
+  az sig image-definition create $(rg_) -l "$AZ_LOCATION" -r "$GALLERY_NAME" -i "$IMAGE_DEFINITION" \
+    --os-type Linux --os-state Generalized --hyper-v-generation V2 --architecture Arm64 \
+    --features SecurityType=TrustedLaunchSupported \
+    -p "$IMAGE_PUBLISHER" -f "$IMAGE_OFFER" -s "$IMAGE_SKU" -o none
+}
+
+# --- build -----------------------------------------------------------------
+build_local() {
+  log "building locally"
+  command -v nix >/dev/null || die "nix not installed"
+  local host; host=$(nix eval --impure --raw --expr builtins.currentSystem)
+  nix build "$ROOT#packages.$host.default" -L -o "$ROOT/result"
+  ls "$ROOT"/result/*.vhd | tee "$STATE/vhd"
+}
+
+builder_up() {
+  if az vm show $(rg_) -n "$BUILDER" -o none 2>/dev/null; then
+    az vm start $(rg_) -n "$BUILDER" -o none; return
+  fi
+  local img; img=$(latest_version)
+  if [ -n "$img" ]; then
+    log "creating builder from our image $img"
+    img=$(image_id "$img")
+  else
+    log "no image yet: creating builder from Ubuntu 24.04 Arm64"
+    img="Canonical:ubuntu-24_04-lts:server-arm64:latest"
+  fi
+  az vm create $(rg_) -n "$BUILDER" -l "$AZ_LOCATION" --size "$BUILDER_SIZE" --image "$img" \
+    --os-disk-size-gb 64 --admin-username "$ADMIN_USER" --ssh-key-values "$SSH_PUBLIC_KEY" \
+    --public-ip-address "" --nsg-rule NONE --tags "$TAG" -o none
+  vm_run "$BUILDER" 'command -v nix >/dev/null || curl -sSfL https://install.determinate.systems/nix | sh -s -- install --no-confirm' >/dev/null
+}
+
+build_remote() {
+  builder_up
+  log "uploading sources to $BUILDER"
+  local src; src=$(git -C "$ROOT" ls-files -z | tar -C "$ROOT" --null -T - -cz | base64 -w0)
+  vm_run "$BUILDER" "rm -rf /root/img && mkdir -p /root/img && cd /root/img && echo $src | base64 -d | tar xz
+    export NIX_CONFIG='$NIXCONF'
+    (setsid nohup nix build path:.#packages.aarch64-linux.default -L -o result > build.log 2>&1 < /dev/null; echo \$? > build.rc) &
+    sleep 2" >/dev/null
+  log "building on $BUILDER (polling)"
+  local out
+  while :; do
+    sleep 45
+    out=$(vm_run "$BUILDER" 'cat /root/img/build.rc 2>/dev/null || echo RUNNING; tail -1 /root/img/build.log | cut -c1-150')
+    grep -q RUNNING <<<"$out" || break
+    grep -v '^$' <<<"$out" | tail -2 | head -1 >&2
+  done
+  grep -qE '^\s*0\s*$' <<<"$(sed -n '/\[stdout\]/{n;p}' <<<"$out")" || { echo "$out" >&2; die "remote build failed"; }
+  echo remote > "$STATE/vhd"
+}
+
+cmd_build() { case "${1:---remote}" in --local) build_local ;; --remote) build_remote ;; *) die "build [--local|--remote]" ;; esac; }
+
+# --- upload & publish ------------------------------------------------------
+cmd_upload() {
+  local ver=${1:-$(next_version)} disk size sas where
+  where=$(cat "$STATE/vhd" 2>/dev/null) || die "run build first"
+  disk="$TEMP_PREFIX-disk-$ver"
+  if [ "$where" = remote ]; then
+    size=$(vm_run "$BUILDER" 'stat -Lc %s /root/img/result/*.vhd' | grep -E '^[0-9]+$')
+  else
+    size=$(stat -Lc %s "$where")
+  fi
+  log "uploading $size bytes to managed disk $disk"
+  az disk create $(rg_) -n "$disk" -l "$AZ_LOCATION" --os-type Linux --hyper-v-generation V2 \
+    --architecture Arm64 --upload-type Upload --upload-size-bytes "$size" --sku Standard_LRS --tags "$TAG" -o none
+  sas=$(az disk grant-access $(rg_) -n "$disk" --access-level Write --duration-in-seconds 7200 --query accessSAS -o tsv)
+  if [ "$where" = remote ]; then
+    vm_run "$BUILDER" "export NIX_CONFIG='$NIXCONF'; nix shell nixpkgs#azure-storage-azcopy -c azcopy copy /root/img/result/*.vhd '$sas' --blob-type PageBlob | tail -2" >&2
+  elif command -v azcopy >/dev/null; then
+    azcopy copy "$where" "$sas" --blob-type PageBlob
+  else
+    nix shell nixpkgs#azure-storage-azcopy -c azcopy copy "$where" "$sas" --blob-type PageBlob
+  fi
+  az disk revoke-access $(rg_) -n "$disk" -o none
+  echo "$ver" > "$STATE/version"
+}
+
+cmd_publish() {
+  local ver=${1:-$(cat "$STATE/version")} disk
+  disk="$TEMP_PREFIX-disk-$ver"
+  log "publishing $GALLERY_NAME/$IMAGE_DEFINITION/$ver"
+  az sig image-version create $(rg_) -r "$GALLERY_NAME" -i "$IMAGE_DEFINITION" -e "$ver" \
+    --os-snapshot "$(az disk show $(rg_) -n "$disk" --query id -o tsv)" --replica-count 1 -o none
+  az disk delete $(rg_) -n "$disk" --yes -o none
+}
+
+# --- test ------------------------------------------------------------------
+cmd_test() {
+  local ver=${1:-$(latest_version)} vm="$TEMP_PREFIX-test" out
+  log "booting $vm from $ver"
+  az vm create $(rg_) -n "$vm" -l "$AZ_LOCATION" --size "$TEST_SIZE" --image "$(image_id "$ver")" \
+    --os-disk-size-gb "$TEST_OS_DISK_GB" --admin-username "$ADMIN_USER" --ssh-key-values "$SSH_PUBLIC_KEY" \
+    --public-ip-address "" --nsg-rule NONE --tags "$TAG" -o none
+  sleep 60
+  local agent; agent=$(az vm get-instance-view $(rg_) -n "$vm" --query 'instanceView.vmAgent.statuses[0].displayStatus' -o tsv)
+  out=$(vm_run "$vm" "
+    check() { if eval \"\$2\" >/dev/null 2>&1; then echo \"PASS \$1\"; else echo \"FAIL \$1\"; fi; }
+    check 'admin user exists'          'id $ADMIN_USER'
+    check 'admin has ssh key'          'test -s /home/$ADMIN_USER/.ssh/authorized_keys'
+    check 'admin passwordless sudo'    'sudo -n -u $ADMIN_USER sudo -n true'
+    check 'root ssh login blocked'     '! grep -q \"^ssh-\" /root/.ssh/authorized_keys'
+    check 'no failed units'            'test -z \"\$(systemctl --failed --no-legend)\"'
+    check 'sshd active'                'systemctl is-active sshd'
+    check 'cloud-final active'         'systemctl is-active cloud-final'
+    check 'root fs grown'              'test \$(df -BG --output=size / | tail -1 | tr -dc 0-9) -ge $((TEST_OS_DISK_GB - 2))'
+    check 'tools on agent PATH'        'command -v sudo tar nix'
+    echo VERSION \$(nixos-version)")
+  echo "agent: $agent"; grep -E '^(PASS|FAIL|VERSION)' <<<"$out"
+  [ "$agent" = Ready ] && ! grep -q '^FAIL' <<<"$out"
+}
+
+# --- cleanup ---------------------------------------------------------------
+cmd_cleanup() {
+  log "deleting temporary resources tagged $TAG"
+  local q="[?tags.\"nixos-azure-image\"=='$TEMP_PREFIX' || starts_with(name,'$TEMP_PREFIX-')]"
+  for vm in $(az vm list $(rg_) --query "$q.name" -o tsv); do az vm delete $(rg_) -n "$vm" --yes -o none & done; wait
+  for _ in 1 2 3 4; do
+    ids=$(az resource list $(rg_) --query "$q.id" -o tsv)
+    [ -z "$ids" ] && break
+    az resource delete --ids $ids -o none 2>/dev/null || true; sleep 10
+  done
+  rm -f "$STATE/vhd"
+  [ -z "${ids:-}" ] || die "left behind: $ids"
+}
+
+cmd_prune() {  # keep the newest N versions (default 1)
+  local keep=${1:-1}
+  for v in $(az sig image-version list $(rg_) -r "$GALLERY_NAME" -i "$IMAGE_DEFINITION" --query '[].name' -o tsv | sort -V | head -n -"$keep"); do
+    log "deleting image version $v"; az sig image-version delete $(rg_) -r "$GALLERY_NAME" -i "$IMAGE_DEFINITION" -e "$v"
+  done
+}
+
+cmd_all() {  # all [--local|--remote]
+  local ver; ver=$(next_version)
+  trap 'cmd_cleanup || true' EXIT
+  cmd_build "${1:---remote}"; cmd_upload "$ver"; cmd_publish "$ver"; cmd_test "$ver"
+  log "published and verified $ver"
+}
+
+c=${1:-}; shift || true
+case "$c" in
+  gallery-init|build|upload|publish|test|cleanup|prune|all) "cmd_${c//-/_}" "$@" ;;
+  version) latest_version ;;
+  *) echo "usage: $0 {gallery-init|build [--local|--remote]|upload [ver]|publish [ver]|test [ver]|cleanup|prune [keep]|all [--local|--remote]|version}" >&2; exit 1 ;;
+esac
