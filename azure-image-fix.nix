@@ -5,8 +5,7 @@
 #  - upstream resizes the file *after* converting it to a fixed VHD, so the
 #    VHD footer ends up mid-file and Azure rejects the upload (InvalidVhd).
 # This grows the raw image (root partition, MiB-aligned) before conversion.
-# The same change is proposed upstream: see upstream/azure-image-auto-disksize.patch.
-# Remove this module once that fix is in the pinned nixpkgs.
+# Kept as our own fix; upstream is not tracked.
 { config, lib, pkgs, modulesPath, ... }:
 let
   cfg = config.virtualisation.azureImage;

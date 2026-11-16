@@ -11,7 +11,6 @@ The image uses the Azure Linux agent (waagent) and cloud-init from nixpkgs' `azu
 | `flake.nix`, `flake.lock` | Pinned nixos-unstable; the output is the image derivation |
 | `configuration.nix` | Image settings: console, cloud-init, sudo, SSH |
 | `azure-image-fix.nix` | Replaces the upstream image builder to fix `diskSize = "auto"` on Gen2 |
-| `upstream/azure-image-auto-disksize.patch` | The same fix as a patch against nixpkgs |
 | `scripts/nixos-azure` | Build, upload, publish, test and clean-up commands |
 | `config.example.env` | Settings template; copy to `config.env` (git-ignored) |
 

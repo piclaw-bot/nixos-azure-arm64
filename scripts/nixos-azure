@@ -13,7 +13,7 @@ CONFIG=${CONFIG:-$ROOT/config.env}
 TAG="nixos-azure-image=$TEMP_PREFIX"
 BUILDER="$TEMP_PREFIX-build"
 NIXCONF=$'experimental-features = nix-command flakes\nextra-system-features = kvm'
-az() { command az ${AZ_SUBSCRIPTION:+--subscription "$AZ_SUBSCRIPTION"} "$@"; }
+az() { command az "$@" ${AZ_SUBSCRIPTION:+--subscription "$AZ_SUBSCRIPTION"}; }
 log() { printf '\033[1m==> %s\033[0m\n' "$*" >&2; }
 die() { echo "error: $*" >&2; exit 1; }
 rg_() { echo -g "$AZ_RESOURCE_GROUP"; }
@@ -28,8 +28,10 @@ vm_run() {
 }
 
 latest_version() {
-  az sig image-version list $(rg_) -r "$GALLERY_NAME" -i "$IMAGE_DEFINITION" \
-    --query "[?provisioningState=='Succeeded'].name" -o tsv 2>/dev/null | sort -V | tail -1
+  local out
+  out=$(az sig image-version list $(rg_) -r "$GALLERY_NAME" -i "$IMAGE_DEFINITION" \
+    --query "[?provisioningState=='Succeeded'].name" -o tsv) || die "cannot list image versions"
+  sort -V <<<"$out" | tail -1
 }
 next_version() {
   local v; v=$(latest_version)
@@ -179,7 +181,7 @@ cmd_prune() {  # keep the newest N versions (default 1)
 }
 
 cmd_all() {  # all [--local|--remote]
-  local ver; ver=$(next_version)
+  local ver; ver=$(next_version) || exit 1
   trap 'cmd_cleanup || true' EXIT
   cmd_build "${1:---remote}"; cmd_upload "$ver"; cmd_publish "$ver"; cmd_test "$ver"
   log "published and verified $ver"
