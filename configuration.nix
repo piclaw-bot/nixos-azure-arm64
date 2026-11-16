@@ -33,6 +33,13 @@
   systemd.services.waagent.path = [ "/run/wrappers" "/run/current-system/sw" ];
   services.openssh.settings.PermitRootLogin = lib.mkForce "no";
 
+  # Don't ship a copy of the nixpkgs source (~1.5 GB) as the default NIX_PATH and
+  # flake registry entry. `nix shell nixpkgs#foo` still works through the global
+  # registry, and a channel or registry pin can be added after deployment.
+  nixpkgs.flake.setNixPath = false;
+  nixpkgs.flake.setFlakeRegistry = false;
+  nix.channel.enable = false;
+
   nix.settings.experimental-features = [ "nix-command" "flakes" ];
   system.stateVersion = "26.05";
 }
